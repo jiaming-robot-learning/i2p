@@ -1,18 +1,20 @@
-name: i2sb
 channels:
-  - anaconda
-  - pytorch
+  # - anaconda
   - conda-forge
+  - pytorch
+  - nvidia
   - defaults
 dependencies:
-  - python=3.8
+  - python=3.9
   - numpy
   - scipy
   - termcolor
   - easydict
   - ipdb
-  - pytorch==1.12
-  - torchvision==0.13
+  - pytorch==1.13.0
+  - torchvision==0.14.0
+  # - torchaudio==0.13.0
+  - cudatoolkit==11.6
   - tqdm
   - scikit-learn
   - imageio
@@ -29,3 +31,5 @@ dependencies:
     - rich
     - lmdb
     - wandb
+    - scikit-image
+    - scikit-fmm

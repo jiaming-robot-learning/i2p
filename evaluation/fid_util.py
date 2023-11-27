@@ -83,7 +83,7 @@ class LMDBResizeDataset(NumpyResizeDataset):
         return np.array(img_pil)
 
 def compute_fid_ref_stat(opt, log):
-    from dataset import imagenet
+    from datasetbk import imagenet
     from torchvision import transforms
 
     mode = opt.mode

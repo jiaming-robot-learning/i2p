@@ -12,7 +12,7 @@ import torch
 
 from .util import unsqueeze_xdim
 
-from ipdb import set_trace as debug
+# from ipdb import set_trace as debug
 
 def compute_gaussian_product_coef(sigma1, sigma2):
     """ Given p1 = N(x_t|x_0, sigma_1**2) and p2 = N(x_t|x_1, sigma_2**2)
@@ -104,7 +104,7 @@ class Diffusion():
                     _prev_step = torch.full((xt.shape[0],), prev_step, device=self.device, dtype=torch.long)
                     std_sb = unsqueeze_xdim(self.std_sb[_prev_step], xdim=x1.shape[1:])
                     xt_true = xt_true + std_sb * torch.randn_like(xt_true)
-                xt = (1. - mask) * xt_true + mask * xt
+                xt = (1. - mask) * xt_true + mask * xt # 1 for traversible
 
             if prev_step in log_steps:
                 pred_x0s.append(pred_x0.detach().cpu())

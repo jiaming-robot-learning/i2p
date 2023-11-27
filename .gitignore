@@ -138,3 +138,8 @@ results/*
 .log/*
 .deprecated/*
 .debug/*
+
+
+data
+
+node_modules
