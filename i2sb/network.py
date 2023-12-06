@@ -75,9 +75,9 @@ class Image256Net(torch.nn.Module):
         self.diffusion_model.eval()
         self.noise_levels = noise_levels
 
-    def forward(self, x, steps, cond=None):
+    def forward(self, x, steps, cond=None, xy=None):
 
         t = self.noise_levels[steps].detach()
         assert t.dim()==1 and t.shape[0] == x.shape[0]
 
-        return self.diffusion_model(x, t)
+        return self.diffusion_model(x, t, xy=xy)

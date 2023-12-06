@@ -33,3 +33,5 @@ dependencies:
     - wandb
     - scikit-image
     - scikit-fmm
+    - diffusers
+    - scikit-video

@@ -481,6 +481,13 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             linear(time_embed_dim, time_embed_dim),
         )
+        xy_embed_dim = model_channels
+        time_embed_dim += xy_embed_dim
+        self.xy_embed = nn.Sequential(
+            linear(2, xy_embed_dim),
+            nn.SiLU(),
+            linear(xy_embed_dim, xy_embed_dim),
+        )
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
@@ -639,7 +646,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None):
+    def forward(self, x, timesteps, y=None, xy=None):
         """
         Apply the model to an input batch.
 
@@ -654,7 +661,9 @@ class UNetModel(nn.Module):
 
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-
+        xy_emb = self.xy_embed(xy)
+        emb = th.cat([emb, xy_emb], dim=1)
+        
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)

@@ -64,9 +64,10 @@ class I2PDataset(Dataset):
         tra_map[tra_map == 0] = -5 # obstacle
         tra_map[data[1][0], data[1][1]] = -10 # goal
         tra_map[tra_map == 1] = 0 # traversible
+        goal_xy = data[1] / 192
 
         dist_map = get_dist_map(self.maps[data[0]], goal_pose=data[1])
         dist_map = dist_map.astype(np.float32) / 500
 
-        return torch.from_numpy(tra_map).unsqueeze(0), torch.from_numpy(dist_map).unsqueeze(0) # (2,H,W), (1,H,W)
+        return torch.from_numpy(tra_map).unsqueeze(0), torch.from_numpy(dist_map).unsqueeze(0), torch.from_numpy(goal_xy) # (2,H,W), (1,H,W)
     

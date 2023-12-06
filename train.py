@@ -22,7 +22,7 @@ from torch.multiprocessing import Process
 
 from logger import Logger
 from distributed_util import init_processes
-from dataset.dataset import I2PDataset
+from dataset.i2p_dataset import I2PDataset
 from i2sb import Runner, download_ckpt
 
 # import colored_traceback.always

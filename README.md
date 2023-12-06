@@ -2,7 +2,7 @@
 ## Environment setup
 
 ```
-Conda env create -f requirements.yml
+Conda env create -f requirements.yml -p ./.venv
 ```
 
 ## Dataset Generation

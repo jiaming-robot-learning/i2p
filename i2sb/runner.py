@@ -115,13 +115,14 @@ class Runner(object):
     def sample_batch(self, opt, loader):
 
         # for i2p, x0 is dist map, x1 is traversible map
-        x1, x0 = next(loader) # traversible, dist map
+        x1, x0, xy = next(loader) # traversible, dist map
         x1 = x1.detach().to(opt.device).float()
         x0 = x0.detach().to(opt.device).float()
+        xy = xy.detach().to(opt.device).float()
         
         mask = x1 == 0 # traversible area, without goal and obstacle
         mask = mask.to(torch.float32)
-        return x0, x1, mask, None, None
+        return x0, x1, mask, None, None, xy
     
 
     def train(self, opt, train_dataset, val_dataset):
@@ -146,14 +147,14 @@ class Runner(object):
             for _ in range(n_inner_loop):
                 # ===== sample boundary pair =====
                 # for i2p, x0 is dist map, x1 is traversible map
-                x0, x1, mask, y, cond = self.sample_batch(opt, train_loader)
+                x0, x1, mask, y, cond, xy = self.sample_batch(opt, train_loader)
                 # ===== compute loss =====
                 step = torch.randint(0, opt.interval, (x0.shape[0],))
 
                 xt = self.diffusion.q_sample(step, x0, x1, ot_ode=opt.ot_ode)
                 label = self.compute_label(step, x0, xt)
 
-                pred = net(xt, step, cond=cond)
+                pred = net(xt, step, cond=cond,xy=xy)
                 assert xt.shape == label.shape == pred.shape
 
                 if mask is not None:
@@ -196,7 +197,7 @@ class Runner(object):
         self.writer.close()
 
     @torch.no_grad()
-    def ddpm_sampling(self, opt, x1, mask=None, cond=None, clip_denoise=False, nfe=None, log_count=10, verbose=True):
+    def ddpm_sampling(self, opt, x1, mask=None, cond=None, clip_denoise=False, nfe=None, log_count=10, verbose=True,xy=None):
 
         # create discrete time steps that split [0, INTERVAL] into NFE sub-intervals.
         # e.g., if NFE=2 & INTERVAL=1000, then STEPS=[0, 500, 999] and 2 network
@@ -222,7 +223,7 @@ class Runner(object):
 
             def pred_x0_fn(xt, step):
                 step = torch.full((xt.shape[0],), step, device=opt.device, dtype=torch.long)
-                out = self.net(xt, step, cond=cond)
+                out = self.net(xt, step, cond=cond,xy=xy)
                 return self.compute_pred_x0(step, xt, out, clip_denoise=clip_denoise)
 
             xs, pred_x0 = self.diffusion.ddpm_sampling(
@@ -242,11 +243,11 @@ class Runner(object):
 
         
         # we view the map as corrupted image, and the dist map as clean image
-        gt_dist, map, mask, y, cond = self.sample_batch(opt, val_loader)
+        gt_dist, map, mask, y, cond,xy = self.sample_batch(opt, val_loader)
 
-        map = map.to(opt.device)
+        # map = map.to(opt.device)
         xs, pred_x0s = self.ddpm_sampling(
-            opt, map, mask=mask, cond=cond, clip_denoise=opt.clip_denoise, verbose=opt.global_rank==0
+            opt, map, mask=mask, cond=cond, clip_denoise=opt.clip_denoise, verbose=opt.global_rank==0, xy=xy
         )
         max_dist = gt_dist.amax(dim=(1,2,3))
         gt_dist = gt_dist / max_dist[:,None,None,None]
