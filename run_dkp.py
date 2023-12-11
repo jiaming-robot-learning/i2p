@@ -1,5 +1,5 @@
 from dkp.kp_dataset import KPDataset
-from dkp.train import main
+from dkp.train_dkp import main
 
 
 

@@ -1,4 +1,8 @@
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+"""
+line classifier
+"""
+
+
 
 from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
@@ -6,8 +10,8 @@ from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 
-from .net import VisualEncoder, MLPNoisePredNet, MLPDenoise, DenoiseTransformerNet
-from .kp_dataset import KPDataset
+from .net import VisualEncoder, MLPNoisePredNet, MLPDenoise, DenoiseTransformerNet, LineClassifier
+from .kp_dataset import KPDataset, KPLDataset
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -44,37 +48,40 @@ def init_process(rank, size, args):
     dist.barrier()
     cleanup()
 
-        
-        
 
 def run(rank,world_size, args):
     """
     Run DKP training on a single GPU 
     """
     
-    dataset = KPDataset(split='train', rank=rank, world_size=world_size)
+    dataset = KPLDataset(split='train', rank=rank, world_size=world_size)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
     )
     if rank == 0:
-        test_dataset = KPDataset(split='test', rank=rank, world_size=world_size)
-    nets = DenoiseTransformerNet(img_size=args.image_size)
+        test_dataset = KPLDataset(split='test', rank=rank, world_size=world_size)
+        test_dataloader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
+    nets = LineClassifier(192)
     nets = nets.to(rank)
     ddp_net = DDP(nets, device_ids=[rank])
+    loss_fn = nn.BCEWithLogitsLoss()
 
     if rank == 0:
         # only need one ema model
         ema_model = EMAModel(ddp_net.parameters(), power=0.75)
     
-    optimizer = torch.optim.Adam(ddp_net.parameters(), lr=args.lr,weight_decay=args.weight_decay) 
+    if not args.use_adamw:
+        optimizer = torch.optim.Adam(ddp_net.parameters(), lr=args.lr,weight_decay=args.weight_decay) 
+    else:
+        optimizer = torch.optim.AdamW(ddp_net.parameters(), lr=args.lr,weight_decay=args.weight_decay) 
     
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=args.num_train_timesteps,
-        beta_schedule='squaredcos_cap_v2', # better?
-        clip_sample=True, # clip to [-1, 1]
-    )
+
 
     lr_scheduler = get_scheduler(
         name='cosine',
@@ -95,84 +102,47 @@ def run(rank,world_size, args):
         """
         Define a metric
         """
-        
-        # for now, simply sample a traj_map from test dataset, sample kp using trained net, and compare to gt kp
-        
-        tra_map, gt_kp = test_dataset[0]
-        tra_map = tra_map.unsqueeze(0).to(rank) # [1,1,H,W]
-
-        n_sample = 200
-        cond = net.module.get_vis_feat(tra_map) # [ batch, feat_dim]
-        
-        # noise kps
-        noisy_kp = torch.rand(n_sample, 2).to(rank) * 2 - 1
-        noisy_kp = noisy_kp.unsqueeze(0) # [1, n_sample, 2]
-        
-        noise_scheduler.set_timesteps(args.num_train_timesteps)  
-        
-        for k in noise_scheduler.timesteps:
-            # ts = torch.ones(n_sample).long().to(rank) * k
-            ts = torch.tensor([k]).long().to(rank)
-            noise_pred = net.module.get_noise_pred(noisy_kp, cond, ts)
-            noisy_kp = noise_scheduler.step(
-                model_output=noise_pred,
-                timestep=k,
-                sample=noisy_kp,
-            ).prev_sample
+        total_correct = 0
+        total = 0
+        print('evaluating...')
+        for batch in tqdm(test_dataloader):
+            tra_map, l, label = batch
+            tra_map = tra_map.to(rank)
+            l = l.to(rank).unsqueeze(1)
+            label = label.to(rank)
             
-        # unnormalize and plot
-        pred_kp = torch.clamp(noisy_kp, -1, 1)
-        pred_kp = pred_kp * (args.image_size/2) + (args.image_size/2)
-        pred_kp = pred_kp.clamp(0, args.image_size-1)
-        pred_kp = pred_kp.cpu().detach().numpy()
-        pred_kp = pred_kp.astype(np.int32)
-        pred_kp = pred_kp[0] # [n_sample, 2]
-        
-        # save pred_kp
-        base_map = tra_map.clone()
-        base_map[tra_map==0] = 255 # obstacle
-        base_map[tra_map==1] = 0 # traversible
-        
-        m = base_map.cpu().numpy().astype(np.uint8)[0,0]
-        for k in pred_kp:
-            m[k[0], k[1]] = 128
-        writer.add_image('eval/pred_kp', m, step, dataformats='HW')
-        
-        
-        # unnormalize gt_kp
-        gt_kp = gt_kp.numpy()
-        gt_kp = gt_kp  * (args.image_size/2) + (args.image_size/2)
-        gt_kp = np.clip(gt_kp, 0, args.image_size-1)
-        gt_kp = gt_kp.astype(np.int32)
-        
-        # # save gt_kp
-        m = base_map.cpu().numpy().astype(np.uint8)[0,0]
-        for k in gt_kp:
-            m[k[0], k[1]] = 128
-        writer.add_image('eval/gt_kp', m, step,dataformats='HW')
-                    
+            # sample timesteps
+
+            # sample noisy kps
+            map_feat = net.module.map_encoder(tra_map)
+            pred = net(l, map_feat).squeeze(1)
+
+            total_correct += ((pred > 0) == label).sum().item()
+            total += label.shape[0]
+        acc = total_correct / total
+        writer.add_scalar('test/acc', acc, step)
+        print(f'Acc: {acc}')
+        return acc
+                         
             
     for epoch in range(args.num_epochs):
         if rank == 0:
             dataloader = tqdm(dataloader)
             
         for i, batch in enumerate(dataloader):
-            tra_map, kp = batch
+            tra_map, l, label = batch
             tra_map = tra_map.to(rank)
-            kp = kp.to(rank)
-            bs = kp.shape[0]
+            l = l.to(rank).unsqueeze(1)
+            label = label.to(rank)
             
             # sample timesteps
-            timesteps = torch.randint(0, args.num_train_timesteps, (bs,)).long().to(rank)
 
             # sample noisy kps
-            noise = torch.randn_like(kp)            
-            noisy_kp = noise_scheduler.add_noise(kp,noise,timesteps)
+            map_feat = ddp_net.module.map_encoder(tra_map)
+            pred = ddp_net(l, map_feat).squeeze(1)
             
-            # noise_pred = ddp_net['noise_pred'](noisy_kp, cond, timesteps)
-            noise_pred = ddp_net(tra_map, noisy_kp, timesteps)
             
-            loss = torch.mean((noise_pred - noise)**2)
+            loss = loss_fn(pred, label)
             
             # optimize
             loss.backward()
@@ -212,15 +182,16 @@ def get_args():
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--master_address", type=str, help="address for master", default='localhost')
-    parser.add_argument("--master_port", type=str, help="port for master", default='6667')
+    parser.add_argument("--master_port", type=str, help="port for master", default='6665')
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--num_epochs", type=int, default=10)
+    parser.add_argument("--num_epochs", type=int, default=20)
     parser.add_argument("--num_train_timesteps", type=int, default=100) # denoising steps
     parser.add_argument("--num_warmup_steps", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--ema_decay", type=float, default=0.75)
+    parser.add_argument("--use_adamw", type=bool, default=False)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=5e-6)
+    parser.add_argument("--weight_decay", type=float, default=5e-5)
     parser.add_argument("--name", type=str, default='debug') 
     parser.add_argument("--num_proc_node", type=int, default=1) # number of processes per node
     parser.add_argument("--n_gpu_per_node", type=int, default=4) # number of gpus per node

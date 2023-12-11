@@ -17,7 +17,8 @@ from .nn import (
     normalization,
     timestep_embedding,
 )
-
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
 
 class Upsample(nn.Module):
     """
@@ -384,11 +385,14 @@ class VisualEncoder(nn.Module):
             
 
     def get_feat_dim(self):
+        """
+        returns: (N, dim), where N is the number of features and dim is the dimensionality of each feature
+        """
         x = th.zeros(1, self.in_channels, self.image_size, self.image_size)
         x = x.type(self.dtype)
         y = self.forward(x)
         
-        return y.view(1, -1).shape[1]
+        return 1, y.view(1, -1).shape[1]
     
     def forward(self, x):
         """
@@ -402,9 +406,7 @@ class VisualEncoder(nn.Module):
         for module in self.input_blocks:
             h = module(h)
            
-        # h = h.type(x.dtype)
-        # return self.out(h)
-        return h.view(h.shape[0], -1)
+        return h.view(h.shape[0], 1, -1) # [B, 1, feat_dim], compatible with the transformer input
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -474,16 +476,210 @@ class MLPDenoise(nn.Module):
         return self.noise_pred(kp, cond, timesteps)
         
         
+        
+        
+################################## Transformers ##################################
 
+
+# helpers
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+# classes
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Attention(nn.Module):
+    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, x):
+        x = self.norm(x)
+
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+        dots = th.matmul(q, k.transpose(-1, -2)) * self.scale
+
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        out = th.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout),
+                FeedForward(dim, mlp_dim, dropout = dropout)
+            ]))
+
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+
+        return self.norm(x)
+
+class ViT(nn.Module):
+    def __init__(self, 
+                 image_size, 
+                 patch_size=16, # 16 | 32
+                 dim=768, 
+                 depth=8, 
+                 heads=8, 
+                 channels = 3, 
+                 dim_head = 64, 
+                 dropout = 0.1, 
+                 emb_dropout = 0.1):
+        super().__init__()
+        image_height, image_width = pair(image_size)
+        patch_height, patch_width = pair(patch_size)
+
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+
+        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim),
+        )
+        
+        # self.time_embedding = SinusoidalPosEmb(dim)
+        self.pos_embedding = nn.Parameter(th.randn(1, num_patches, dim)) 
+        self.dropout = nn.Dropout(emb_dropout)
+
+        self.transformer = Transformer(dim, depth, heads, dim_head, dim*4, dropout)
+
+
+    def forward(self, img):
+        x = self.to_patch_embedding(img)
+        # t = self.time_embedding(timestep)
+        # x = th.cat([t, x], dim=1)
+        b, n, _ = x.shape
+
+        x += self.pos_embedding[:, :n]
+        x = self.dropout(x)
+
+        x = self.transformer(x)
+
+        return x
+        
+class PatchConv(nn.Module):
+    """
+    Patchify the input map, and then apply conv layers to each patch
+    """
+    def __init__(self,
+                 image_size,
+                 patch_size=16, # 16 | 32
+                 in_channels=1,
+                 model_channels=4,
+                 num_layers=4, 
+                 patch_dim=768,
+                 ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.in_channels = in_channels
+        
+        self.h = image_size // patch_size
+        self.w = image_size // patch_size
+        
+        self.conv_layers = nn.ModuleList([])
+        self.conv_layers.append(nn.Sequential(
+            nn.Conv2d(in_channels, model_channels, 3, padding=1),
+            nn.GroupNorm(2, model_channels),
+            nn.SiLU(),
+        ))
+        for _ in range(num_layers-1):
+            self.conv_layers.append(nn.Sequential(
+                nn.Conv2d(model_channels, model_channels, 3, padding=1),
+                nn.GroupNorm(2, model_channels),
+                nn.SiLU(),
+            ))
+        
+        self.patch_emb = nn.Linear(patch_size**2*model_channels, patch_dim)
+        self.pos_emb = nn.Parameter(th.zeros(1, self.h*self.w, patch_dim))
+        
+    def get_feat_dim(self):
+        """
+        returns: (N, dim), where N is the number of features and dim is the dimensionality of each feature
+        """
+        x = th.zeros(1, self.in_channels, self.image_size, self.image_size)
+        y = self.forward(x)
+        
+        return y.shape[1], y.shape[2]
+     
+    def forward(self, x):
+        """
+        x: [B, C, H, W]
+        
+        """
+        
+        patches = rearrange(x, 'b c (h p1) (w p2) -> (b h w) c p1 p2', p1 = self.patch_size, p2 = self.patch_size) # [BHW, C, p1, p2]
+      
+        for conv_layer in self.conv_layers:
+            patches = conv_layer(patches)
+        
+        patches = rearrange(patches, '(b h w) c p1 p2 -> b (h w) (c p1 p2)', 
+                            h = self.h, w = self.w, p1 = self.patch_size, p2 = self.patch_size) 
+        
+        patches = self.patch_emb(patches) # [B, HW, patch_dim]
+        patches = patches + self.pos_emb # [B, HW, patch_dim]
+        
+        return patches # [B, HW, C*p1*p2]
+    
 class DenoiseTransformer(nn.Module):
+    """
+    Transformer with encoder and decoder
+    """
     
     def __init__(self, 
                  map_feat_dim, 
+                 map_feat_n_tokens=1,
                  emb_dim=768,
-                 timestep_emb_dim=64,
                  n_head=12,
                  dropout=0.1,
-                 n_layers=8,
+                 n_layers=6,
                  ) -> None:
         """
         @param map_feat_dim: visual condition embedding dimension
@@ -492,27 +688,19 @@ class DenoiseTransformer(nn.Module):
         """
         super().__init__()
 
-        # # learnable positional embedding for map and timestep
-        # self.cond_pos_emb = nn.Parameter(th.zeros(1, 2 , emb_dim)) 
-        
+
+        self.cond_n = 1 # 1 for timestep
+
         # map feat embedding        
-        self.map_emb = nn.Sequential(
-            nn.Linear(map_feat_dim, emb_dim),
-            nn.Linear(emb_dim, emb_dim * 4),
-            nn.SiLU(),
-            nn.Linear(emb_dim * 4, emb_dim),
-        )
+        # self.map_emb = nn.Linear(map_feat_dim, emb_dim)
 
         # timestep embedding
-        self.timestep_emb = nn.Sequential(
-            SinusoidalPosEmb(timestep_emb_dim),
-            nn.Linear(timestep_emb_dim, timestep_emb_dim * 4),
-            nn.SiLU(),
-            nn.Linear(timestep_emb_dim * 4, emb_dim),
-        )
+        self.timestep_emb = SinusoidalPosEmb(emb_dim)
+    
+        self.pos_embedding = nn.Parameter(th.zeros(1, self.cond_n, emb_dim)) # learnable positional embedding for map and timestep
         
         # input embedding
-        self.kp_emb = nn.Linear(2, emb_dim)
+        self.kp_emb = nn.Linear(2, emb_dim) # 2 for kp
         
         # decoder
         decoder_layer = nn.TransformerDecoderLayer(
@@ -538,12 +726,12 @@ class DenoiseTransformer(nn.Module):
         
         self.apply(self._init_weights)
         
+        # print model params
         total_params = sum(p.numel() for p in self.parameters())
-        map_emb_params = sum(p.numel() for p in self.map_emb.parameters())
         timestep_emb_params = sum(p.numel() for p in self.timestep_emb.parameters())
         decoder_params = sum(p.numel() for p in self.decoder.parameters())
-        print('Denoise transformer total params: {}, map_emb_params: {}, timestep_emb_params: {}, decoder_params: {}'.format(
-            total_params, map_emb_params, timestep_emb_params, decoder_params)
+        print('Denoise transformer total params: {},  timestep_emb_params: {}, decoder_params: {}'.format(
+            total_params, timestep_emb_params, decoder_params)
         )
         
     def _init_weights(self, module):
@@ -591,13 +779,17 @@ class DenoiseTransformer(nn.Module):
     def forward(self,noisy_kp, map_feat, timesteps):
         """
         @param noisy_kp: [B, N, 2]
-        @param map_feat: [B, map_feat_dim]
-        @param timesteps: [B, N]
+        @param map_feat: [B, N', emb_dim]
+        @param timesteps: [B]
         """
-        # map_feat = map_feat + self.cond_pos_emb[:, 0, :] # [B, emb_dim]
-        map_emb = self.map_emb(map_feat).unsqueeze(1) # [B, 1, emb_dim]
+        # map_emb = self.map_emb(map_feat) # [B, N', emb_dim]
+        map_emb = map_feat
         te = self.timestep_emb(timesteps).unsqueeze(1) # [B, 1, emb_dim]
-        memory = th.concat([map_emb, te], dim=1) # [B, 2, emb_dim]
+        te = te + self.pos_embedding # [B, 1, emb_dim]
+        
+        memory = th.concat([te, map_emb], dim=1) # [B, 1+N', emb_dim]
+        # memory = memory + self.pos_embedding # [B, 1+N', emb_dim]
+        
         memory = self.dropout(memory)
         
         x = self.kp_emb(noisy_kp) # [B, N, emb_dim]
@@ -614,22 +806,108 @@ class DenoiseTransformer(nn.Module):
         return y
     
 class DenoiseTransformerNet(nn.Module):
-    def __init__(self, img_size) -> None:
+    def __init__(self, img_size,use_patch_encoder=True, use_line_pred=True) -> None:
         super().__init__()
-        self.vis_encoder = VisualEncoder(image_size=img_size)
-        self.map_feat_dim = self.vis_encoder.get_feat_dim()
-        self.denoise = DenoiseTransformer(self.map_feat_dim)
+        if not use_patch_encoder:
+            self.vis_encoder = VisualEncoder(image_size=img_size)
+        else:
+            self.vis_encoder = PatchConv(image_size=img_size)
+            # self.vis_encoder = ViT(image_size=img_size)
+            
+        if use_line_pred:
+            self.line_pred = LineClassifier()
+            
+        self.use_line_pred = use_line_pred
+        
+        self.map_feat_n_tokens, self.map_feat_dim = self.vis_encoder.get_feat_dim()
+        
+        self.denoise = DenoiseTransformer(
+            map_feat_dim=self.map_feat_dim,
+            map_feat_n_tokens=self.map_feat_n_tokens,
+        )
         
     def forward(self, tra_map, noisy_kp, timesteps):
         cond = self.vis_encoder(tra_map)
         noise_pred = self.denoise(noisy_kp, cond, timesteps)
         return noise_pred
     
+    def get_line_pred(self,lines, memory):
+        """
+        args: lines [B, N, 4]
+                memory [B, N', emb_dim]
+        """
+        assert self.use_line_pred
+        return self.line_pred(lines, memory)
+    
     def get_feat_dim(self):
-        return self.map_feat_dim
+        return self.map_feat_n_tokens, self.map_feat_dim
     
     def get_vis_feat(self, tra_map):
-        return self.vis_encoder(tra_map)
+        return self.vis_encoder(tra_map) # [B, N|1, feat_dim]
     
     def get_noise_pred(self, kp, cond, timesteps):
         return self.denoise(kp, cond, timesteps)
+
+        
+        
+##########################################################################################
+# Line classifier
+##########################################################################################
+
+class LineClassifier(nn.Module):
+    def __init__(self,
+                emb_dim=768,
+                n_head=12,
+                dropout=0.1,
+                n_layers=3,
+                 ) -> None:
+        super().__init__()
+        
+        # self.map_encoder = PatchConv(image_size=image_size)
+
+        # input embedding
+        self.l_emb = nn.Linear(4, emb_dim) # 2 for [x1, y1, x2, y2]
+        
+        # decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+                        d_model=emb_dim, 
+                        nhead=n_head,
+                        dim_feedforward=emb_dim * 4,
+                        dropout=dropout,
+                        batch_first=True,
+                        norm_first=True,
+                        activation='gelu',
+                        )
+        self.decoder = nn.TransformerDecoder(
+                        decoder_layer=decoder_layer,
+                        num_layers=n_layers,
+                        norm=nn.LayerNorm(emb_dim),
+                        )
+        
+        # decoder head
+        self.ln_f = nn.LayerNorm(emb_dim)
+        self.head = nn.Linear(emb_dim, 1) # 1 for line classification
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self,lines, memory):
+        """
+        @param lines [B, N, 4]
+        @param mem [B, N', emb_dim]
+        
+        """
+        
+        memory = self.dropout(memory)
+        
+        x = self.l_emb(lines) # [B, N, emb_dim]
+        x = self.dropout(x)
+        
+        y = self.decoder(
+            tgt = x, # [B, N, embdim]
+            memory = memory, # [B, N', emb_dim]
+        )
+        
+        y = self.ln_f(y)
+        y = self.head(y) # [B, N, 1]
+        
+        return y
